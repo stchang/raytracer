@@ -4,60 +4,54 @@
          plot/utils ; vector fns
          racket/generic)
 
-(define WIDTH 640)
-(define HEIGHT 480)
-
 ;; color pixels -- first number is alpha
-(define red-pix (bytes 255 255 0 0))
-(define green-pix (bytes 255 0 255 0))
-(define blue-pix (bytes 255 0 0 255))
-(define black-pix (bytes 255 0 0 0))
-(define clear-pix (bytes 0 0 0 0))
-(define white-pix (bytes 255 255 255 255))
+(define red-pixel (bytes 255 255 0 0))
+(define green-pixel (bytes 255 0 255 0))
+(define blue-pixel (bytes 255 0 0 255))
+(define black-pixel (bytes 255 0 0 0))
+(define clear-pixel (bytes 0 0 0 0))
+(define white-pixel (bytes 255 255 255 255))
 
-;; A Point is a vector #(x y z).
 
-;; A Light is a (Light Point Number)
-;;  The Point is the position of the light.
-;;  The Number is the light's intensity.
+;; A Point is a (Racket) vector #(x y z) representing coordinate (x,y,z).
+
+;; A Dir is a Point representing a direction.
+;; The Point represents a unit length (Euclidean) vector with origin (0,0,0).
+
+;; A Light is a (Light pos intensity) : Point Number -> Light
+;; representing a light source where
+;; - pos represents the position of the light
+;; - intensity represent's the light's intensity.
 (struct Light (pos intensity))
 
-;; A Ray is a Point that represents a unit vector originating from #(0,0,0).
+;; A Ray is a (Ray pos dir) : Point Dir -> Ray
+;; representing an infinite (Euclidean) vector where
+;; - pos is the tail of the Ray
+;; - dir is the direction of the Ray.
+(struct Ray (pos dir))
 
-;; A Cam is a Ray.
-;; We assume the Cam is at the origin #(0,0,0). The Ray representing the Cam
-;;  indicates the Cam's direction.
+;; A Cam is a (Cam pos dir right up) : Point Dir Dir Dir -> Cam
+;; representing a camera where
+;; - pos is the position
+;; - dir is the direction where the camera is pointed
+;; - right is the right direction relative to the camera's forward direction
+;; - up is the camera's relative up direction.
+(struct Cam (pos dir right up))
 
 ;; mk-cam : Number Number Number -> Cam
-(define (mk-cam x y z) (vnormalize (vector x y z)))
+;; Takes two points, one for position, and one for direction, and returns a Cam
+(define (mk-cam pos look) 
+  (define dir (vnormalize (v- look pos)))
+  (define right (vnormalize (vcross #(0 -1 0) dir)))
+  (define up (vnormalize (vcross right dir)))
+  (Cam pos dir right up))
 
-;; these constants are used when calculating rays
-;; -- needed to maintain proper aspect ratio
-;;    bc both x and yoffset are multiplied by unit vector
-;; ie if WIDTH > HEIGHT, then 0 < xoffset < 1
-;;                        and 0 < yoffset < HEIGHT/WIDTH
-(define WIDTH-SCALE (if (> WIDTH HEIGHT) 1 (/ WIDTH HEIGHT)))
-(define HEIGHT-SCALE (if (> HEIGHT WIDTH) 1 (/ HEIGHT WIDTH)))
-(define (mk-ray x y cam right up)
-  (vnormalize 
-   (v+ cam (v+ (v* right (* (- (/ x WIDTH) 0.5) WIDTH-SCALE))
-               (v* up (* (- (/ y HEIGHT) 0.5) HEIGHT-SCALE))))))
-
-;(define rays
-;  (for*/list ([x (in-range WIDTH)] [y (in-range HEIGHT)])
-;    (mk-ray x y)))
-;;    (define xoffset (/ x DIV))
-;;    (define yoffset (/ y DIV))
-;;    (vnormalize (v+ cam (v+ (v* right xoffset)
-;;                            (v* up yoffset))))))
 
 (define-generics shape
-  ;; intersect : Shape Point [Point] -> Number
-  ;; Returns the distance between start and the intersection point of the vector
-  ;; represented by start and dir with the given shape, if that vector 
-  ;; infinitely extended. Returns +inf.0. If no starting point is specified, 
-  ;; then #(0,0,0) is assumed.
-  (intersect shape dir [start])
+  ;; intersect : Shape Ray -> Number
+  ;; Returns the distance from the start of the given ray to the shape
+  ;; Returns +inf.0 if no intersection.
+  (intersect shape ray)
   ;; get-norm : Shape Point -> Ray
   ;; Returns the Ray that is perpendicular to the Shape, at the given point.
   (get-norm shape pt))
@@ -67,7 +61,8 @@
 (struct Sphere (center radius) 
   #:super struct:Shape
   #:methods gen:shape
-  [(define (intersect s dir [pos #(0 0 0)])
+  [(define (intersect s ray)
+     (match-define (Ray pos dir) ray)
      (define center (Sphere-center s))
      (define radius (Sphere-radius s))
      (define vec-to-center (v- center pos))
@@ -98,7 +93,8 @@
 (struct Plane (pt norm)
   #:super struct:Shape
   #:methods gen:shape
-  [(define (intersect this-plane dir [pos #(0 0 0)])
+  [(define (intersect this-plane ray)
+     (match-define (Ray pos dir) ray)
      (define pt (Plane-pt this-plane))
      (define norm (Plane-norm this-plane))
      (define denom (vdot dir norm))
@@ -109,13 +105,8 @@
            (if (< dist 0) +inf.0 dist))))
   (define (get-norm this-plane pt) (Plane-norm this-plane))])
          
-
-;(define pix (make-bytes 32))
-;
-;(send scene get-argb-pixels 0 0 2 2 pix)
-;
-;pix 
-
+;; bs is (bytes alpha r g b) representing a color
+;; scale is number in [0,1]
 (define (scale-color bs scale)
   (define argb (bytes->list bs))
   (apply bytes 
@@ -130,55 +121,63 @@
   (define dist-to-light (vmag vec-to-light))
   (for/or ([other-shape other-shapes]
            #:unless (eq? other-shape shape))
-    (< (intersect other-shape (vnormalize vec-to-light) isectpt)
+    (< (intersect other-shape (Ray isectpt (vnormalize vec-to-light)))
        dist-to-light)))
 
-(define (render cam lght shapes filename)
-  
-  (define scene (make-bitmap WIDTH HEIGHT))
+                               
+;; the 0.5 adjustment is so the camera is centered, as opposed to in the
+;; top-left of the picture
+(define (mk-ray x width width-scale y height height-scale cam)
+  (match-define (Cam pos dir right up) cam)
+  (Ray
+   pos
+   (vnormalize 
+    (v+ dir (v+ (v* right (* (- (/ x width) 0.5) width-scale))
+                (v* up (* (- (/ y height) 0.5) height-scale)))))))
 
-  ;; right, with respect to the direction of cam
-  (define right (vnormalize (vcross #(0 -1 0) cam)))
-  ;; up, with respect to the direction of cam
-  (define up (vnormalize (vcross right cam)))
-
-  (for* ([x (in-range WIDTH)]
-         [y (in-range HEIGHT)])
-    (define ray (mk-ray x y cam right up))
+(define (render width height background-color cam lght shapes filename)
+  (define scene (make-bitmap width height))
+  ;; these constants are used when calculating rays
+  ;; -- needed to maintain proper aspect ratio
+  (define width-scale (if (> width height) 1 (/ width height)))
+  (define height-scale (if (> height width) 1 (/ height width)))
+  (for* ([x (in-range width)]
+         [y (in-range height)])
+    (define ray (mk-ray x width width-scale y height height-scale cam))
+    (match-define (Ray ray-pos ray-dir) ray)
     (define min-dist-shape (argmin (λ (sh) (intersect sh ray)) shapes))
     (define min-dist (intersect min-dist-shape ray)) ;; duplicate calc
     (send 
      scene 
-     set-argb-pixels x (- HEIGHT y 1) 1 1
+     ;; subtract from height so 0 height is bottom instead of top
+     set-argb-pixels x (- height y 1) 1 1
      (if (= min-dist +inf.0)
-         clear-pix
-         (let* ([isectpt (v* ray min-dist)]
+         clear-pixel
+         (let* ([isectpt (v+ ray-pos (v* ray-dir min-dist))]
                 [normray (get-norm min-dist-shape isectpt)]
                 [lightreflectray (vnormalize (v- (Light-pos lght) isectpt))])
            (define reflect-intensity (abs (vdot lightreflectray normray)))
-           (cond [(> reflect-intensity 1) clear-pix]
-                 [(blocked? isectpt min-dist-shape shapes lght) black-pix]
+           (cond [(> reflect-intensity 1) clear-pixel]
+                 [(blocked? isectpt min-dist-shape shapes lght) black-pixel]
                  [else
                   (define intensity (* (Light-intensity lght) reflect-intensity))
                   (scale-color (Shape-color min-dist-shape) intensity)])))))
-
   (send scene save-file filename 'png))
 
-(define cam (mk-cam 0 0 -1))
+;(define cam (mk-cam #(0 0 0) #(0 0 -1)))
+;(define sph1 (Sphere red-pixel #(4 12 10) 3))
+;(define sph2 (Sphere red-pixel #(0 8 8) 1))
+;(define sph3 (Sphere red-pixel #(2 2 -10) 1))
+;(define shapes (list sph3))
+;(define lght (Light #(0 10 -2) 1))
+;(render 640 480 clear-pixel cam lght shapes "a.png")
 
-(define sph1 (Sphere red-pix #(4 12 10) 3))
-(define sph2 (Sphere red-pix #(0 8 8) 1))
-(define sph3 (Sphere red-pix #(2 2 -10) 1))
-
-(define shapes (list sph3))
-
-(define lght (Light #(0 10 -2) 1))
-
-;(render cam lght shapes "a.png")
-(render (mk-cam 5 -5 10) 
+(render 640 480
+        clear-pixel
+        (mk-cam #(0 0 0) #(5 -5 10))
         (Light #(15 15 -10) 1)
-        (list (Plane white-pix #(5 -6 10) (vnormalize #(0 1 0)))
-              (Sphere red-pix #(1 -5 10) 1)
-              (Sphere green-pix #(5 -5 10) 1)
-              (Sphere blue-pix #(9 -5 10) 1))
+        (list (Plane white-pixel #(5 -6 10) (vnormalize #(0 1 0)))
+              (Sphere red-pixel #(1 -5 10) 1)
+              (Sphere green-pixel #(5 -5 10) 1)
+              (Sphere blue-pixel #(9 -5 10) 1))
         "b.png")
